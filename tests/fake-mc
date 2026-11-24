@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Synthetic protocol fixture, not captured MinIO output."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+
+args = [arg for arg in sys.argv[1:] if arg not in ("--json", "--no-color")]
+state_dir = os.environ.get("TRAMP_MINIO_FAKE_STATE")
+names = ("file.txt", "new.txt")
+modified = "2026-01-01T00:00:00Z"
+
+
+def emit(**row):
+    print(json.dumps({"status": "success", **row}))
+
+
+def content(name):
+    if state_dir:
+        path = Path(state_dir) / name
+        if path.is_file():
+            return path.read_bytes()
+    return b"test" if name == "file.txt" else None
+
+
+def missing():
+    print(json.dumps({"status": "error", "code": "NoSuchKey"}))
+    sys.exit(1)
+
+
+if args == ["--version"]:
+    print("mc version RELEASE.2026-01-01T00-00-00Z")
+elif args == ["alias", "list"]:
+    emit(alias="lab", URL="https://example.invalid")
+elif args == ["ls", "lab/"]:
+    emit(key="bucket/", type="folder")
+elif args == ["ls", "lab/bucket/"]:
+    for name in names:
+        data = content(name)
+        if data is not None:
+            emit(key=name, type="file", size=len(data), lastModified=modified)
+elif len(args) >= 2 and args[-1] in [f"lab/bucket/{name}" for name in names]:
+    name = args[-1].rsplit("/", 1)[1]
+    data = content(name)
+    if args[:-1] in (["stat"], ["stat", "--no-list"]) and data is not None:
+        emit(name=name, type="file", size=len(data),
+             etag=hashlib.sha256(data).hexdigest(), lastModified=modified)
+    elif args[:-1] in (["stat"], ["stat", "--no-list"]):
+        print(json.dumps({"status": "error", "error": {
+            "type": "fatal", "cause": {"message": "Object does not exist", "error": {}}
+        }}))
+        sys.exit(1)
+    elif args[:-1] == ["cat"] and data is not None:
+        sys.stdout.buffer.write(data)
+    elif args[:-1] == ["pipe"] and state_dir:
+        data = sys.stdin.buffer.read()
+        (Path(state_dir) / name).write_bytes(data)
+        print(f"\r 0 B / ? \r {len(data)} B / ?  14 B/s", end="")
+        emit(target=args[-1], size=len(data))
+    else:
+        missing()
+else:
+    missing()
