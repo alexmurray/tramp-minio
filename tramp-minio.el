@@ -636,7 +636,11 @@ ID-FORMAT selects numeric or string identifiers."
           (when visit
             (setq buffer-file-name name tramp-minio--visited-name name
                   tramp-minio--visited-identity (cdr download) tramp-minio--needs-revert nil)
-            (set-visited-file-modtime (and (nth 2 (cdr download)) (date-to-time (nth 2 (cdr download)))))
+            ;; Emacs can return an integer timestamp from date-to-time,
+            ;; but set-visited-file-modtime reserves integers for flags.
+            (let ((modified (nth 2 (cdr download))))
+              (set-visited-file-modtime
+               (and modified (time-convert (date-to-time modified) 'list))))
             (set-buffer-modified-p nil)
             ;; Do not create remote backups, locks or local autosave copies implicitly.
             (tramp-minio--inhibit-buffer-conveniences))
