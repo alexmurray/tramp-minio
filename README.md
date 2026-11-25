@@ -66,9 +66,10 @@ The TRAMP filename syntax is:
 /minio:ALIAS:/BUCKET/KEY
 ```
 
-`ALIAS` is the name of an `mc` alias, and everything after the second
-colon is the bucket and object key path.  User names, ports, and
-multi-hop filenames are not supported.
+`ALIAS` is the name of an `mc` alias (letters, digits, `-`, and `_`,
+starting with a letter), and everything after the second colon is the
+bucket and object key path.  User names, ports, and multi-hop filenames
+are not supported.
 
 ```elisp
 (dired "/minio:minio:/")                  ; list buckets

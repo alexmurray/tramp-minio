@@ -8,7 +8,6 @@ import sys
 
 args = [arg for arg in sys.argv[1:] if arg not in ("--json", "--no-color")]
 state_dir = os.environ.get("TRAMP_MINIO_FAKE_STATE")
-names = ("file.txt", "new.txt")
 modified = "2026-01-01T00:00:00Z"
 
 
@@ -16,16 +15,29 @@ def emit(**row):
     print(json.dumps({"status": "success", **row}))
 
 
-def content(name):
+def bucket_dir():
+    return Path(state_dir) / "objects" / "bucket" if state_dir else None
+
+
+def extra_buckets():
+    if not state_dir:
+        return []
+    bdir = Path(state_dir) / "buckets"
+    if not bdir.is_dir():
+        return []
+    return sorted(p.name for p in bdir.iterdir() if p.is_dir())
+
+
+def content(rel):
     if state_dir:
-        path = Path(state_dir) / name
+        path = Path(state_dir) / rel
         if path.is_file():
             return path.read_bytes()
-    return b"test" if name == "file.txt" else None
+    return b"test" if rel == "file.txt" else None
 
 
-def missing():
-    print(json.dumps({"status": "error", "code": "NoSuchKey"}))
+def missing(code="NoSuchKey"):
+    print(json.dumps({"status": "error", "code": code}))
     sys.exit(1)
 
 
@@ -35,16 +47,47 @@ elif args == ["alias", "list"]:
     emit(alias="lab", URL="https://example.invalid")
 elif args == ["ls", "lab/"]:
     emit(key="bucket/", type="folder")
+    for b in extra_buckets():
+        emit(key=f"{b}/", type="folder")
+elif len(args) == 2 and args[0] == "mb" and args[1].startswith("lab/"):
+    bname = args[1][len("lab/"):].rstrip("/")
+    if not state_dir or "/" in bname or not bname:
+        missing("AccessDenied")
+    if bname == "bucket" or bname in extra_buckets():
+        print(json.dumps({"status": "error", "code": "BucketAlreadyOwnedByYou"}))
+        sys.exit(1)
+    (Path(state_dir) / "buckets" / bname).mkdir(parents=True, exist_ok=True)
+    emit(bucket=bname)
 elif args == ["ls", "lab/bucket/"]:
-    for name in names:
-        data = content(name)
-        if data is not None:
-            emit(key=name, type="file", size=len(data), lastModified=modified)
-elif len(args) >= 2 and args[-1] in [f"lab/bucket/{name}" for name in names]:
-    name = args[-1].rsplit("/", 1)[1]
-    data = content(name)
+    seen = set()
+    data = content("file.txt")
+    if data is not None:
+        emit(key="file.txt", type="file", size=len(data), lastModified=modified)
+        seen.add("file.txt")
+    if state_dir:
+        for p in sorted(Path(state_dir).iterdir()):
+            if p.name in ("buckets", "objects") or p.name in seen:
+                continue
+            if p.is_dir():
+                emit(key=f"{p.name}/", type="folder")
+            elif p.is_file():
+                b = p.read_bytes()
+                emit(key=p.name, type="file", size=len(b), lastModified=modified)
+elif len(args) >= 2 and args[-1].startswith("lab/bucket/") and len(args[-1]) > len("lab/bucket/"):
+    rel = args[-1][len("lab/bucket/"):]
+    if args == ["ls", args[-1]] and rel.endswith("/") and state_dir:
+        pdir = Path(state_dir) / rel.rstrip("/")
+        if pdir.is_dir():
+            for p in sorted(pdir.iterdir()):
+                if p.is_dir():
+                    emit(key=f"{p.name}/", type="folder")
+                elif p.is_file():
+                    b = p.read_bytes()
+                    emit(key=p.name, type="file", size=len(b), lastModified=modified)
+        sys.exit(0)
+    data = content(rel)
     if args[:-1] in (["stat"], ["stat", "--no-list"]) and data is not None:
-        emit(name=name, type="file", size=len(data),
+        emit(name=rel.rsplit("/", 1)[-1], type="file", size=len(data),
              etag=hashlib.sha256(data).hexdigest(), lastModified=modified)
     elif args[:-1] in (["stat"], ["stat", "--no-list"]):
         print(json.dumps({"status": "error", "error": {
@@ -53,10 +96,12 @@ elif len(args) >= 2 and args[-1] in [f"lab/bucket/{name}" for name in names]:
         sys.exit(1)
     elif args[:-1] == ["cat"] and data is not None:
         sys.stdout.buffer.write(data)
-    elif args[:-1] == ["pipe"] and state_dir:
+    elif args[:-1] == ["pipe"] and state_dir and not rel.endswith("/"):
         data = sys.stdin.buffer.read()
-        (Path(state_dir) / name).write_bytes(data)
-        print(f"\r 0 B / ? \r {len(data)} B / ?  14 B/s", end="")
+        target_path = Path(state_dir) / rel
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_bytes(data)
+        print(f"\r 0 B / 1,024 B [=>] (0%) \r {len(data)} B / ?  14 B/s", end="")
         emit(target=args[-1], size=len(data))
     else:
         missing()

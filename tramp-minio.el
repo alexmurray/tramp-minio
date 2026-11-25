@@ -372,12 +372,11 @@ Never expose raw client diagnostics, which can contain credentials."
                                               (alist-get 'code cause)
                                               ;; mc can discard the S3 code when stat fails.
                                               (and (equal (car args) "stat")
-                                                   (equal (alist-get 'status r) "error")
                                                    (equal (alist-get 'type error-row) "fatal")
                                                    (equal (assq 'error cause) '(error))
                                                    (equal (alist-get 'message cause) "Object does not exist")
                                                    "NoSuchKey"))))))
-                             rows))))
+                             (cl-remove-if-not (lambda (r) (equal (alist-get 'status r) "error")) rows)))))
         (cond ((member "AccessDenied" codes)
                (signal 'file-error (list "MinIO access denied" (car args))))
               ((and codes (cl-every (lambda (code) (member code '("NoSuchKey" "NoSuchBucket"))) codes))
@@ -415,10 +414,14 @@ Never expose raw client diagnostics, which can contain credentials."
           (tramp-minio--cached 'aliases tramp-minio-alias-cache-ttl #'tramp-minio--alias-info)))
 
 (defun tramp-minio--expand (name &optional directory)
-  "Expand filesystem paths, rejecting repeated slashes in explicit remote keys."
-  (when (and (tramp-minio-file-name-p name)
-             (string-match-p "//" (tramp-file-name-localname (tramp-dissect-file-name name t))))
-    (signal 'file-error '("Repeated slashes in MinIO keys are unsupported")))
+  "Expand filesystem paths, rejecting repeated slashes in MinIO keys."
+  (let ((base (or directory default-directory)))
+    (when (or (and (tramp-minio-file-name-p name)
+                   (string-match-p "//" (tramp-file-name-localname (tramp-dissect-file-name name t))))
+              (and (not (file-name-absolute-p name))
+                   (tramp-minio-file-name-p base)
+                   (string-match-p "//" name)))
+      (signal 'file-error '("Repeated slashes in MinIO keys are unsupported"))))
   (tramp-handle-expand-file-name name directory))
 
 (defun tramp-minio--target (name)
@@ -435,11 +438,16 @@ Never expose raw client diagnostics, which can contain credentials."
 (defun tramp-minio--attrs (row &optional directory id-format identity)
   "Translate ROW to synthetic file attributes for IDENTITY."
   (let* ((dir (or directory (equal (alist-get 'type row) "folder")))
-         (time (if (alist-get 'lastModified row) (date-to-time (alist-get 'lastModified row)) '(0 0)))
+         (modified (alist-get 'lastModified row))
+         (raw-size (alist-get 'size row))
+         (time (if (and (stringp modified) (not (string-empty-p modified)))
+                   (date-to-time modified)
+                 '(0 0)))
+         (size (if (and (not dir) (integerp raw-size) (>= raw-size 0)) raw-size 0))
          (id (if (eq id-format 'string) "minio" -1))
          (mode (if tramp-minio-read-only (if dir "dr-x------" "-r--------")
                  (if dir "drwx------" "-rw-------"))))
-    (list (and dir t) 1 id id time time time (if dir 0 (or (alist-get 'size row) 0))
+    (list (and dir t) 1 id id time time time size
           mode nil (sxhash-equal identity) (sxhash-equal (and identity (file-remote-p identity))))))
 
 (defun tramp-minio--entries (directory &optional id-format)
@@ -463,14 +471,20 @@ Never expose raw client diagnostics, which can contain credentials."
   "Fetch fresh metadata for NAME, returning nil only on a recognised absence."
   (condition-case nil
       (let ((rows (apply #'tramp-minio--run "stat" (append tramp-minio-stat-arguments (list (tramp-minio--target name))))))
-        (unless (= (length rows) 1) (signal 'file-error '("Ambiguous or empty mc stat response")))
-        (let ((row (car rows)))
-          (unless (and (equal (alist-get 'status row) "success")
-                       (integerp (alist-get 'size row)) (>= (alist-get 'size row) 0)
-                       (stringp (alist-get 'lastModified row))
-                       (or (stringp (alist-get 'etag row)) (stringp (alist-get 'versionID row))))
-            (signal 'file-error '("Invalid MinIO stat schema")))
-          row))
+        (cond ((zerop (length rows))
+               (signal 'file-error '("Ambiguous or empty mc stat response")))
+              ((> (length rows) 1)
+               (if (member "--no-list" tramp-minio-stat-arguments)
+                   (signal 'file-error '("Ambiguous or empty mc stat response"))
+                 nil))
+              (t (let ((row (car rows)))
+                   (unless (and (equal (alist-get 'status row) "success")
+                                (or (equal (alist-get 'type row) "folder")
+                                    (and (integerp (alist-get 'size row)) (>= (alist-get 'size row) 0)
+                                         (stringp (alist-get 'lastModified row))
+                                         (or (stringp (alist-get 'etag row)) (stringp (alist-get 'versionID row))))))
+                     (signal 'file-error '("Invalid MinIO stat schema")))
+                   row))))
     (tramp-minio-missing nil)))
 
 (defun tramp-minio--parent-attributes (name id-format)
@@ -491,34 +505,53 @@ ID-FORMAT selects numeric or string identifiers."
           ((or (string-suffix-p "/" name) (string-match-p "\\`[^/]+/[^/]+\\'" target))
            (tramp-minio--parent-attributes name id-format))
           (t (let ((row (tramp-minio--stat name)))
-               (if row (tramp-minio--attrs row nil id-format name)
+               (if (and row (not (equal (alist-get 'type row) "folder")))
+                   (tramp-minio--attrs row nil id-format name)
                  (tramp-minio--parent-attributes name id-format)))))))
 
 (defun tramp-minio--exists (name) (and (tramp-minio--file-attributes name) t))
 (defun tramp-minio--directory-p (name) (eq t (car (tramp-minio--file-attributes name))))
 (defun tramp-minio--regular-p (name) (let ((a (tramp-minio--file-attributes name))) (and a (not (car a)))))
 (defun tramp-minio--writable-p (name)
-  (and (not tramp-minio-read-only) tramp-minio-allow-overwrite
-       (or (tramp-minio--exists name) (tramp-minio--directory-p (file-name-directory (expand-file-name name))))))
+  (let* ((expanded (expand-file-name name))
+         (target (tramp-minio--target expanded)))
+    (and (not tramp-minio-read-only) tramp-minio-allow-overwrite
+         (or (tramp-minio--exists expanded)
+             (tramp-minio--directory-p (file-name-directory expanded))
+             ;; Virtual prefixes need not pre-exist for object keys; check the bucket.
+             (and (string-match "\\`[^/]+/\\([^/]+\\)/.+" target)
+                  (not (string-suffix-p "/" target))
+                  (tramp-minio--directory-p
+                   (concat (file-remote-p expanded) "/" (match-string 1 target) "/")))))))
 (defun tramp-minio--modes (name &optional _flag)
   (let ((a (tramp-minio--file-attributes name)))
     (when a (if (car a) (if tramp-minio-read-only #o500 #o700) (if tramp-minio-read-only #o400 #o600)))))
 
+(defun tramp-minio--filter-directory-items (items directory key-fn full match nosort count)
+  "Filter, sort, truncate, and optionally qualify directory ITEMS."
+  (let ((case-fold-search nil)
+        (dir (file-name-as-directory (expand-file-name directory))))
+    (when match (setq items (cl-remove-if-not (lambda (x) (string-match-p match (funcall key-fn x))) items)))
+    (unless nosort (setq items (sort items (lambda (a b) (string-lessp (funcall key-fn a) (funcall key-fn b))))))
+    (when count (setq items (seq-take items count)))
+    (if full
+        (mapcar (lambda (x)
+                  (if (consp x) (cons (concat dir (car x)) (cdr x)) (concat dir x)))
+                items)
+      items)))
+
 (defun tramp-minio--directory-files (directory &optional full match nosort count)
-  (let ((case-fold-search nil) (names (append '("." "..") (mapcar #'car (tramp-minio--entries directory)))))
-    (when match (setq names (cl-remove-if-not (lambda (n) (string-match-p match n)) names)))
-    (unless nosort (setq names (sort names #'string-lessp)))
-    (when (and count (> (length names) count)) (setq names (seq-take names count)))
-    (if full (mapcar (lambda (n) (concat (file-name-as-directory (expand-file-name directory)) n)) names) names)))
+  (let ((names (append '("." "..") (mapcar #'car (tramp-minio--entries directory)))))
+    (tramp-minio--filter-directory-items names directory #'identity full match nosort count)))
 
 (defun tramp-minio--directory-files-and-attributes (directory &optional full match nosort id-format count)
-  (let ((case-fold-search nil) (entries (tramp-minio--entries directory id-format)))
-    (setq entries (append (list (cons "." (tramp-minio--attrs nil t id-format directory))
-                                (cons ".." (tramp-minio--attrs nil t id-format (file-name-directory (directory-file-name directory))))) entries))
-    (when match (setq entries (cl-remove-if-not (lambda (e) (string-match-p match (car e))) entries)))
-    (unless nosort (setq entries (sort entries (lambda (a b) (string-lessp (car a) (car b))))))
-    (when count (setq entries (seq-take entries count)))
-    (if full (mapcar (lambda (e) (cons (concat (file-name-as-directory (expand-file-name directory)) (car e)) (cdr e))) entries) entries)))
+  (let* ((dir (file-name-as-directory (expand-file-name directory)))
+         (bare (directory-file-name dir))
+         (parent (directory-file-name (file-name-directory bare)))
+         (entries (append (list (cons "." (tramp-minio--attrs nil t id-format bare))
+                                (cons ".." (tramp-minio--attrs nil t id-format parent)))
+                          (tramp-minio--entries dir id-format))))
+    (tramp-minio--filter-directory-items entries dir #'car full match nosort count)))
 
 (defun tramp-minio--file-name-all-completions (filename directory)
   "Complete FILENAME in DIRECTORY, adding a trailing slash to directories."
@@ -557,28 +590,29 @@ ID-FORMAT selects numeric or string identifiers."
 
 (defun tramp-minio--download (name)
   "Download NAME and return (TEMPFILE . IDENTITY), checking for concurrent changes."
-  (let* ((target (tramp-minio--object-target name)) (before (tramp-minio--stat name))
-         (tmp (tramp-minio--temp (tramp-minio--suffix name))) success)
-    (unwind-protect
-        (progn
-          (unless before (signal 'file-missing (list "No such MinIO object" name)))
-          (when (equal (alist-get 'type before) "folder") (signal 'file-error '("Cannot download prefix")))
-          ;; cat emits raw bytes, never JSON.  Version IDs pin versioned reads.
-          (pcase-let ((`(,status ,data ,_)
-                       (tramp-minio--process
-                        (append '("--no-color") tramp-minio-arguments '("cat")
-                                (let ((id (alist-get 'versionID before)))
-                                  (when (and (stringp id) (not (member id '("" "null")))) (list "--version-id" id)))
-                                (list target)) tramp-minio-transfer-timeout t nil tmp)))
-            (unless (and (zerop status) (equal (file-attribute-size (file-attributes tmp)) (alist-get 'size before)))
-              (signal 'file-error '("MinIO download failed or size changed")))
-            (ignore data))
-          (unless (equal (tramp-minio--endpoint name) (tramp-minio--endpoint name t))
-            (signal 'file-error '("MinIO alias changed during download")))
-          (unless (equal (tramp-minio--identity before name) (tramp-minio--identity (tramp-minio--stat name) name))
-            (signal 'file-error '("MinIO object changed during download; retry")))
-          (setq success t) (cons tmp (tramp-minio--identity before name)))
-      (unless success (delete-file tmp)))))
+  (let* ((target (tramp-minio--object-target name))
+         (before (tramp-minio--stat name)))
+    (unless before (signal 'file-missing (list "No such MinIO object" name)))
+    (when (equal (alist-get 'type before) "folder") (signal 'file-error '("Cannot download prefix")))
+    (let ((tmp (tramp-minio--temp (tramp-minio--suffix name))) success)
+      (unwind-protect
+          (progn
+            ;; cat emits raw bytes, never JSON.  Version IDs pin versioned reads.
+            (pcase-let ((`(,status ,data ,_)
+                         (tramp-minio--process
+                          (append '("--no-color") tramp-minio-arguments '("cat")
+                                  (let ((id (alist-get 'versionID before)))
+                                    (when (and (stringp id) (not (member id '("" "null")))) (list "--version-id" id)))
+                                  (list target)) tramp-minio-transfer-timeout t nil tmp)))
+              (unless (and (zerop status) (equal (file-attribute-size (file-attributes tmp)) (alist-get 'size before)))
+                (signal 'file-error '("MinIO download failed or size changed")))
+              (ignore data))
+            (unless (equal (tramp-minio--endpoint name) (tramp-minio--endpoint name t))
+              (signal 'file-error '("MinIO alias changed during download")))
+            (unless (equal (tramp-minio--identity before name) (tramp-minio--identity (tramp-minio--stat name) name))
+              (signal 'file-error '("MinIO object changed during download; retry")))
+            (setq success t) (cons tmp (tramp-minio--identity before name)))
+        (unless success (delete-file tmp))))))
 
 (defun tramp-minio--local-copy (name) (car (tramp-minio--download name)))
 
@@ -588,7 +622,7 @@ ID-FORMAT selects numeric or string identifiers."
   (when (and visit (or beg end)) (signal 'file-error '("Partial visiting is unsupported")))
   (let* ((download (condition-case err (tramp-minio--download name)
                      (file-missing
-                      (when (and visit (not (tramp-minio--stat name)))
+                      (when visit
                         (setq buffer-file-name name
                               tramp-minio--visited-name name
                               tramp-minio--visited-identity (tramp-minio--missing-identity name)
@@ -650,7 +684,7 @@ ID-FORMAT selects numeric or string identifiers."
                                              tramp-minio-transfer-timeout nil tmp)))
             ;; Some mc releases prefix pipe's JSON with carriage-return
             ;; progress frames even in JSON mode.
-            (when (string-match "\\`\r[[:alnum:] ./?:%+\r-]*{" out)
+            (when (string-match "\\`\r[^\n{]*{" out)
               (setq out (substring out (1- (match-end 0)))))
             (let* ((rows (and (zerop status)
                               (condition-case nil (tramp-minio--json-lines out)
@@ -672,23 +706,34 @@ ID-FORMAT selects numeric or string identifiers."
   (setq name (expand-file-name name))
   (when (and tramp-minio--needs-revert (equal name buffer-file-name))
     (signal 'file-error '("Revert MinIO buffer before another save")))
-  (when (and (equal name buffer-file-name) (not (and (equal name tramp-minio--visited-name) tramp-minio--visited-identity)))
-    (signal 'file-error '("Unknown MinIO buffer identity; revert first")))
   (when (or append (eq mustbenew 'excl)) (signal 'file-error '("MinIO append/exclusive creation unsupported")))
-  (let ((tmp (tramp-minio--temp (tramp-minio--suffix name))))
+  (let ((tmp (tramp-minio--temp (tramp-minio--suffix name)))
+        (allow-existing (not mustbenew)))
     (unwind-protect
         (let ((coding-system-for-write (or coding-system-for-write
                                            (cdr (find-operation-coding-system 'write-region start end name)))))
+          (when (and mustbenew (tramp-minio--stat name))
+            (unless tramp-minio-allow-overwrite
+              (signal 'file-already-exists (list "MinIO overwrite not enabled" name)))
+            (unless (yes-or-no-p (format "Overwrite %s? " name))
+              (signal 'file-already-exists (list "File already exists" name)))
+            (setq allow-existing t))
           (write-region start end tmp nil 'silent)
-          (tramp-minio--upload name tmp (or (not mustbenew) (not (tramp-minio--stat name))
-                                           (yes-or-no-p (format "Overwrite %s? " name)))
+          (tramp-minio--upload name tmp allow-existing
                                (and (equal name tramp-minio--visited-name) tramp-minio--visited-identity))
-          (when (or (eq visit t) (stringp visit))
-            (setq buffer-file-name (if (stringp visit) visit name)
-                  tramp-minio--visited-name nil tramp-minio--visited-identity nil
-                  tramp-minio--needs-revert t)
-            (set-visited-file-modtime '(0 0)) (set-buffer-modified-p nil)
-            (message "Uploaded; revert before editing again to establish a fresh object identity")))
+          (cond ((or (eq visit t) (stringp visit))
+                 (let ((visited (if (stringp visit) (expand-file-name visit) name)))
+                   (setq buffer-file-name visited
+                         tramp-minio--visited-name nil tramp-minio--visited-identity nil
+                         tramp-minio--needs-revert (and (tramp-minio-file-name-p visited) t))
+                   (set-visited-file-modtime '(0 0)) (set-buffer-modified-p nil)
+                   (when (tramp-minio-file-name-p visited)
+                     (setq-local file-precious-flag nil)
+                     (tramp-minio--inhibit-buffer-conveniences)
+                     (message "Uploaded; revert before editing again to establish a fresh object identity"))))
+                ((equal name buffer-file-name)
+                 (setq tramp-minio--visited-name nil tramp-minio--visited-identity nil
+                       tramp-minio--needs-revert t))))
       (delete-file tmp))))
 
 (defun tramp-minio--copy (source destination &optional ok keep-time preserve-uid preserve-extended-attributes)
@@ -700,15 +745,27 @@ ID-FORMAT selects numeric or string identifiers."
     (when dst (tramp-minio--mutation))
     (when (file-directory-p destination)
       (setq destination (expand-file-name (file-name-nondirectory source) (file-name-as-directory destination))))
-    (when (or (equal source destination) (file-directory-p source) (and dst keep-time)) (tramp-minio--unsupported))
-    (when (and (file-exists-p destination) (or (null ok) (integerp ok)))
-      (unless (and (integerp ok) (yes-or-no-p (format "Overwrite %s? " destination)))
-        (signal 'file-already-exists (list destination))))
-    (let ((tmp (if src (tramp-minio--local-copy source) source)))
+    (when (equal source destination)
+      (signal 'file-error (list "Copying file to itself" source)))
+    (when (or (file-directory-p source) (and dst keep-time)) (tramp-minio--unsupported))
+    (when (and (file-exists-p destination) (null ok))
+      (signal 'file-already-exists (list "File already exists" destination)))
+    (when (and dst (not tramp-minio-allow-overwrite))
+      (signal 'file-error '("mc cannot guarantee exclusive creation; enable tramp-minio-allow-overwrite to accept the race")))
+    (when (and (file-exists-p destination) (integerp ok))
+      (unless (yes-or-no-p (format "Overwrite %s? " destination))
+        (signal 'file-already-exists (list "File already exists" destination)))
+      (setq ok t))
+    (let* ((download (when src (tramp-minio--download source)))
+           (tmp (if src (car download) source)))
       (unwind-protect
           (if dst (tramp-minio--upload destination tmp (not (null ok)))
             (progn (copy-file tmp destination ok)
-                   (when keep-time (set-file-times destination (file-attribute-modification-time (file-attributes source))))))
+                   (when keep-time
+                     (let ((mtime (if src
+                                      (and (nth 2 (cdr download)) (date-to-time (nth 2 (cdr download))))
+                                    (file-attribute-modification-time (file-attributes source)))))
+                       (when mtime (set-file-times destination mtime))))))
         (when src (delete-file tmp))))))
 
 (defun tramp-minio--delete (&rest _args)
@@ -717,12 +774,14 @@ ID-FORMAT selects numeric or string identifiers."
 (defun tramp-minio--rename (&rest _args)
   "Reject non-atomic rename to eliminate source deletion risks."
   (tramp-minio--unsupported))
-(defun tramp-minio--mkdir (name &optional _parents)
+(defun tramp-minio--mkdir (name &optional parents)
   "Create a bucket only; virtual prefixes are not directories."
   (tramp-minio--mutation)
-  (let ((target (tramp-minio--target name)))
-    (unless (string-match-p "\\`[^/]+/[^/]+/?\\'" target) (tramp-minio--unsupported))
-    (unwind-protect (tramp-minio--run "mb" target) (tramp-minio-clear-cache))) nil)
+  (let ((target (string-remove-suffix "/" (tramp-minio--target name))))
+    (unless (string-match-p "\\`[^/]+/[^/]+\\'" target) (tramp-minio--unsupported))
+    (unless (and parents (tramp-minio--directory-p name))
+      (unwind-protect (tramp-minio--run "mb" target) (tramp-minio-clear-cache))))
+  nil)
 
 (defun tramp-minio--access (name string)
   "Signal an error if NAME is not visible. STRING is the error message."
@@ -731,9 +790,37 @@ ID-FORMAT selects numeric or string identifiers."
 (defun tramp-minio--dired-uncache (&rest _args) (tramp-minio-clear-cache))
 
 (defun tramp-minio--insert-directory (file switches &optional wildcard full-directory-p)
-  (let ((ls-lisp-use-insert-directory-program nil))
+  (defvar ls-lisp-dirs-first)
+  (defvar ls-lisp-emulation)
+  (defvar ls-lisp-ignore-case)
+  (defvar ls-lisp-use-insert-directory-program)
+  (defvar ls-lisp-verbosity)
+  (unless switches (setq switches ""))
+  (when (and (directory-name-p file) (not full-directory-p))
+    (setq switches (concat switches " -F")))
+  (let (ls-lisp-emulation ls-lisp-ignore-case ls-lisp-dirs-first
+        ls-lisp-verbosity ls-lisp-use-insert-directory-program
+        (listing-start (point)))
+    (when (fboundp 'ls-lisp-set-options) (ls-lisp-set-options))
     (tramp-run-real-handler 'insert-directory
-                            (list file switches wildcard full-directory-p))))
+                            (list file switches wildcard full-directory-p))
+    (unless (seq-some (lambda (option)
+                        (and (not (string-prefix-p "--" option))
+                             (string-search "l" option)))
+                      (split-string switches))
+      (save-excursion
+        (save-restriction
+          (narrow-to-region listing-start (point))
+          (goto-char (point-min))
+          (while (< (point) (point-max))
+            (let* ((end (line-end-position))
+                   (start (text-property-not-all (point) end 'dired-filename t)))
+              (when start
+                (delete-region start (or (text-property-any start end 'dired-filename t)
+                                         end))))
+            (if (eolp)
+                (delete-region (point) (progn (forward-line 1) (point)))
+              (forward-line 1))))))))
 
 (defun tramp-minio--truename (name &rest _args) (expand-file-name name))
 
@@ -837,6 +924,7 @@ ID-FORMAT selects numeric or string identifiers."
     (tramp-minio--inhibit-buffer-conveniences)))
 (add-hook 'find-file-hook #'tramp-minio--visit-policy)
 (add-hook 'after-change-major-mode-hook #'tramp-minio--visit-policy)
+(add-hook 'after-set-visited-file-name-hook #'tramp-minio--visit-policy)
 
 (defun tramp-minio-file-name-handler (operation &rest args)
   (when tramp-minio-debug (message "tramp-minio: %S" operation))
@@ -864,6 +952,7 @@ ID-FORMAT selects numeric or string identifiers."
   "Remove MinIO registrations and cached metadata."
   (remove-hook 'find-file-hook #'tramp-minio--visit-policy)
   (remove-hook 'after-change-major-mode-hook #'tramp-minio--visit-policy)
+  (remove-hook 'after-set-visited-file-name-hook #'tramp-minio--visit-policy)
   (tramp-minio-clear-cache)
   (setq tramp-methods (assoc-delete-all "minio" tramp-methods)
         tramp-default-host-alist (assoc-delete-all "minio" tramp-default-host-alist)
